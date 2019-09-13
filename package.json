@@ -1,0 +1,16 @@
+{
+  "name": "@wellmade/puppeteer-crawler",
+  "version": "1.0.0",
+  "private": true,
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "meow": "^5.0.0",
+    "puppeteer": "^1.19.0"
+  }
+}
