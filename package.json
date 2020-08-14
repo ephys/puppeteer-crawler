@@ -10,7 +10,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "lighthouse": "^6.2.0",
     "meow": "^5.0.0",
-    "puppeteer": "^1.19.0"
+    "puppeteer": "^5.2.1"
   }
 }
