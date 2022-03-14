@@ -8,6 +8,8 @@ const lighthouse = require('lighthouse');
 const puppeteer = require('puppeteer');
 const meow = require('meow');
 
+// TODO: dedupe based on redirection
+
 // TODO: respect noindex/nofollow if flag is set
 // TODO: use sitemap.xml
 // TODO: collect robots.txt
@@ -26,35 +28,38 @@ function md4(text) {
 
 const cliName = path.relative(process.cwd(), process.argv[1]);
 
+const validMetaTypes = ['anchors', 'resources', 'lighthouse'];
+
 const cli = meow(`
 	Usage
 	  $ ${cliName} <url>
 
 	Options
-	  --domain-alias <url>  Add an extra domain that the scraper can consider as being the same domain as the base url.
-	  --collect-meta        Collect SEO metadata (title, description, etc) of crawled webpages.
-	  --delay <delay>       Pause time between two page fetches in ms (default to 500ms).
-	  --lighthouse          Run lighthouse on crawled pages.
+	  --check-externals      Checks whether the external links are still alive
+	  --domain-alias <url>   Add an extra domain that the scraper can consider as being the same domain as the base url.
+	  --collect-meta <types> Collect SEO metadata of crawled webpages. Types: ${validMetaTypes.join(', ')} (comma-separated).
+	  --delay <delay>        Pause time between two page fetches in ms (default to 500ms).
+	  --lighthouse           Run lighthouse on crawled pages.
 
 	Examples
 	  $ ${cliName} https://wellmade.be --domain-alias https://www.wellmade.be
 `, {
   flags: {
+    'check-externals': {
+      type: 'boolean',
+      default: false,
+    },
     'domain-alias': {
       type: 'string',
     },
     'collect-meta': {
-      type: 'boolean',
-      default: false,
+      type: 'string',
+      default: '',
     },
     'delay': {
       type: 'string',
       inferType: true,
       default: '500',
-    },
-    'lighthouse': {
-      type: 'boolean',
-      default: false,
     },
   }
 });
@@ -72,23 +77,31 @@ let browser;
   const seoFile = `${process.cwd()}/${slugify(canonicalHost)}.seo.json`;
 
   const delay = Number(cli.flags.delay);
-  const collectSeo = cli.flags.collectMeta || false;
-  const collectLighthouse = cli.flags.lighthouse || false;
+  const collectMetaTypes = cli.flags.collectMeta.split(',');
+  for (const collectableSeoPart of collectMetaTypes) {
+    if (!validMetaTypes.includes(collectableSeoPart)) {
+      throw new Error(`${collectableSeoPart} is not a valid meta type (expected one or multiple of ${validMetaTypes.join(', ')} separated by a comma)`);
+    }
+  }
+  const collectMeta = collectMetaTypes.length > 0;
+  const collectLighthouse = collectMetaTypes.includes('lighthouse');
+
   const validDomains = !cli.flags.domainAlias
     ? []
     : Array.isArray(cli.flags.domainAlias)
     ? cli.flags.domainAlias
     : [cli.flags.domainAlias];
+  const checkExternals = cli.flags.checkExternals;
 
   validDomains.push(initialUrl);
 
   console.info(`SAVING STATE TO ${stateFile}`);
-  if (collectSeo) {
-    console.info(`SAVING SEO TO ${seoFile}`);
+  if (collectMeta) {
+    console.info(`SAVING METADATA TO ${seoFile}`);
   }
 
   const initialState = await getInitialState(stateFile);
-  const seoState = collectSeo ? await getInitialState(seoFile) || {} : null;
+  const seoState = collectMeta ? await getInitialState(seoFile) || {} : null;
 
   browser = await puppeteer.launch();
   const page = await browser.newPage();
@@ -104,7 +117,7 @@ let browser;
     pendingUrls.add(url);
   }
 
-  if (collectSeo) {
+  if (collectMeta) {
     let moved = 0;
 
     for (const url of visitedUrls) {
@@ -131,7 +144,8 @@ let browser;
     await sleep(delay);
 
     const visitingUrl = pendingUrls.values().next().value;
-    const pageMeta = {};
+    const isVisitingExternal = !isSameDomain(validDomains, visitingUrl);
+    const pageMeta = Object.create(null);
 
     console.log('[VISITING]', visitingUrl);
 
@@ -140,7 +154,7 @@ let browser;
        document, stylesheet, image, media, font, script, texttrack, xhr, fetch, eventsource, websocket, manifest, other
        */
 
-      if (collectSeo) {
+      if (collectMeta) {
         const url = request.url();
         const type = request.resourceType();
 
@@ -155,11 +169,13 @@ let browser;
     };
 
     try {
-      page.on('request', logRequests);
+      if (collectMetaTypes.includes('resources')) {
+        page.on('request', logRequests);
+      }
 
       try {
         // if we collect SEO: we wait for page to be fully loaded as we collect the list of referenced resources
-        const response = await page.goto(visitingUrl, collectSeo ? { waitUntil: 'networkidle2' } : undefined);
+        const response = await page.goto(visitingUrl, collectMetaTypes.includes('resources') ? { waitUntil: 'networkidle2' } : undefined);
         if (!response.ok()) {
           console.error('[COULD NOT NAVIGATE]', visitingUrl, `(${response.status()})`);
           unreachableUrls.add(visitingUrl);
@@ -173,57 +189,65 @@ let browser;
         continue;
       }
 
-      const { anchors, meta: seoMeta } = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll('a')).map(anchor => anchor.href);
+      if (!isVisitingExternal) {
+        const { anchors, meta: seoMeta } = await page.evaluate(() => {
+          const anchors = Array.from(document.querySelectorAll('a')).map(anchor => anchor.href);
 
-        const metaTags = document.querySelectorAll('meta[name="robots"], meta[name="description"], meta[name="keywords"], meta[property^="og:"], meta[name^="twitter:"]');
-        const metaMapping = {};
-        for (const metaTag of metaTags) {
-          const name = metaTag.getAttribute('name') || metaTag.getAttribute('property');
-          metaMapping[name] = metaTag.content;
-        }
+          const metaTags = document.querySelectorAll('meta[name="robots"], meta[name="description"], meta[name="keywords"], meta[property^="og:"], meta[name^="twitter:"]');
+          const metaMapping = {};
+          for (const metaTag of metaTags) {
+            const name = metaTag.getAttribute('name') || metaTag.getAttribute('property');
+            metaMapping[name] = metaTag.content;
+          }
 
-        const meta = {
-          title: document.title,
-          ...metaMapping,
-        };
+          const meta = {
+            title: document.title,
+            ...metaMapping,
+          };
 
-        return {
-          anchors,
-          meta,
-        };
-      });
-
-      if (collectSeo) {
-        const pageHash = md4(await page.content());
-        let lighthouseScore;
-        if (collectLighthouse) {
-          lighthouseScore = await runLighthouse(browser, visitingUrl);
-        }
-
-        seoState[visitingUrl] = Object.assign(pageMeta, seoMeta, {
-          anchors,
-          lighthouse: lighthouseScore,
-          hash: pageHash,
+          return {
+            anchors,
+            meta,
+          };
         });
 
-        // seoState[visitingUrl].microdata = await evaluateMicrodata(page);
-        saveState(seoFile, seoState);
-      }
+        if (collectMeta) {
+          const pageHash = md4(await page.content());
+          let lighthouseScore;
+          if (collectLighthouse) {
+            lighthouseScore = await runLighthouse(browser, visitingUrl);
+          }
 
-      for (const url of anchors) {
+          seoState[visitingUrl] = Object.assign(pageMeta, seoMeta, {
+            anchors,
+            lighthouse: lighthouseScore,
+            hash: pageHash,
+          });
 
-        if (!url) {
-          continue;
+          // seoState[visitingUrl].microdata = await evaluateMicrodata(page);
+          saveState(seoFile, seoState);
         }
 
-        const normalized = normalizeUrl(url, canonicalHost);
+        for (const url of anchors) {
+          if (!url) {
+            continue;
+          }
 
-        if (!isSameDomain(validDomains, url)) {
-          externalUrls.add(url);
-        } else if (!visitedUrls.has(normalized) && !pendingUrls.has(normalized)) {
-          pendingUrls.add(normalized);
-          console.log('[DISCOVERED]', normalized);
+          const isExternal = !isSameDomain(validDomains, url);
+
+          const normalized = isExternal ? normalizeExternalUrl(url) : normalizeUrl(url, canonicalHost);
+
+          if (isExternal) {
+            externalUrls.add(url);
+          }
+
+          if (!isExternal || checkExternals) {
+            if (!visitedUrls.has(normalized) && !pendingUrls.has(normalized)) {
+              pendingUrls.add(normalized);
+
+              console.log('[DISCOVERED]', normalized);
+            }
+          }
         }
       }
 
@@ -253,18 +277,25 @@ function normalizeUrl(urlStr, canonicalHost) {
   const url = new URL(urlStr);
 
   // TODO option --force-https
-  if (url.protocol === 'http:') {
+  if (url.protocol === 'http:' && url.hostname !== 'localhost') {
     url.protocol = 'https:';
   }
 
   // TODO option --canonical-url
   url.host = canonicalHost;
 
-  // TODO option --include-hash
-  // url.hash === '' because if url ends with #, hash is '' instead of '#'
-  // if (url.hash === '' || url.hash === '#' || url.hash === '#null') {
+  // TODO option --include-hash (but normalize # to '')
+  url.hash = '';
   url.md4 = '';
-  // }
+
+  return url.toString();
+}
+
+function normalizeExternalUrl(urlStr) {
+  const url = new URL(urlStr);
+
+  url.hash = '';
+  url.md4 = '';
 
   return url.toString();
 }
