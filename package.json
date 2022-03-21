@@ -13,6 +13,7 @@
     "chalk": "^5.0.1",
     "lighthouse": "^6.2.0",
     "meow": "^5.0.0",
+    "micromatch": "^4.0.4",
     "puppeteer": "^5.2.1"
   }
 }

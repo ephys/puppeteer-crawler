@@ -7,6 +7,7 @@ const path = require('path');
 const lighthouse = require('lighthouse');
 const puppeteer = require('puppeteer');
 const meow = require('meow');
+const micromatch = require('micromatch');
 
 // TODO: dedupe based on redirection
 
@@ -36,6 +37,7 @@ const cli = meow(`
 
 	Options
 	  --check-externals      Checks whether the external links are still alive
+	  --path-filter         These paths will be treated as external and won't be crawled unless --check-externals is provided. Can be provided multiple times. Micromatch syntax.
 	  --domain-alias <url>   Add an extra domain that the scraper can consider as being the same domain as the base url.
 	  --collect-meta <types> Collect SEO metadata of crawled webpages. Types: ${validMetaTypes.join(', ')} (comma-separated).
 	  --delay <delay>        Pause time between two page fetches in ms (default to 500ms).
@@ -45,6 +47,11 @@ const cli = meow(`
 	  $ ${cliName} https://wellmade.be --domain-alias https://www.wellmade.be
 `, {
   flags: {
+    'path-filter': {
+      type: 'string',
+      isMultiple: true,
+      default: [],
+    },
     'check-externals': {
       type: 'boolean',
       default: false,
@@ -77,7 +84,8 @@ let browser;
   const seoFile = `${process.cwd()}/${slugify(canonicalHost)}.seo.json`;
 
   const delay = Number(cli.flags.delay);
-  const collectMetaTypes = cli.flags.collectMeta.split(',');
+  const collectMetaTypes = cli.flags.collectMeta.trim().split(',').filter(Boolean);
+
   for (const collectableSeoPart of collectMetaTypes) {
     if (!validMetaTypes.includes(collectableSeoPart)) {
       throw new Error(`${collectableSeoPart} is not a valid meta type (expected one or multiple of ${validMetaTypes.join(', ')} separated by a comma)`);
@@ -86,14 +94,22 @@ let browser;
   const collectMeta = collectMetaTypes.length > 0;
   const collectLighthouse = collectMetaTypes.includes('lighthouse');
 
-  const validDomains = !cli.flags.domainAlias
-    ? []
-    : Array.isArray(cli.flags.domainAlias)
-    ? cli.flags.domainAlias
+  const internalPatterns = !cli.flags.pathFilter ? []
+    : Array.isArray(cli.flags.pathFilter) ? cli.flags.pathFilter
+    : [cli.flags.pathFilter];
+
+  const validDomains = !cli.flags.domainAlias ? []
+    : Array.isArray(cli.flags.domainAlias) ? cli.flags.domainAlias
     : [cli.flags.domainAlias];
   const checkExternals = cli.flags.checkExternals;
 
   validDomains.push(initialUrl);
+
+  function isExternalUrl(urlStr) {
+    const urlObj = new URL(urlStr);
+
+    return (internalPatterns.length > 0 && !micromatch.all(urlObj.pathname, internalPatterns)) || !isSameDomain(validDomains, urlStr);
+  }
 
   console.info(`SAVING STATE TO ${stateFile}`);
   if (collectMeta) {
@@ -144,10 +160,10 @@ let browser;
     await sleep(delay);
 
     const visitingUrl = pendingUrls.values().next().value;
-    const isVisitingExternal = !isSameDomain(validDomains, visitingUrl);
+    const isVisitingExternal = isExternalUrl(visitingUrl);
     const pageMeta = Object.create(null);
 
-    console.log('[VISITING]', visitingUrl);
+    console.log(isVisitingExternal ? '[VISITING EXTERNAL]' : '[VISITING]', visitingUrl);
 
     const logRequests = request => {
       /*
@@ -233,7 +249,7 @@ let browser;
             continue;
           }
 
-          const isExternal = !isSameDomain(validDomains, url);
+          const isExternal = isExternalUrl(url);
 
           const normalized = isExternal ? normalizeExternalUrl(url) : normalizeUrl(url, canonicalHost);
 
