@@ -8,20 +8,24 @@ const lighthouse = require('lighthouse');
 const puppeteer = require('puppeteer');
 const meow = require('meow');
 const micromatch = require('micromatch');
-
-// TODO: dedupe based on redirection
+const retry = require('retry-as-promised');
+const uniq = require('lodash/uniq');
 
 // TODO: respect noindex/nofollow if flag is set
 // TODO: use sitemap.xml
 // TODO: collect robots.txt
-// TODO: handle rel=alternate
-// TODO: handle rel=canonical
-// TODO: disable auto-redirect & log redirection chains - https://github.com/puppeteer/puppeteer/issues/1132
+// TODO: log redirection chains
 // TODO: if a page has the same MD5 as another, tag them as "potential canonicals" & warn if they're not tagged as canonicals of one-another
 // TODO: run lighthouse mobile + desktop
 // TODO: check if #anchor exists?
 // TODO: remove anchor when requesting a page?
-// TODO: normalize trailing /
+
+// TODO: normalization:
+//  - handle rel=alternate
+//  - handle rel=canonical
+//  - normalize trailing /
+//  - normalize based on redirection
+// TODO: handle http 304
 
 function md4(text) {
   return crypto.createHash('md4').update(text).digest('hex');
@@ -189,13 +193,37 @@ let browser;
         page.on('request', logRequests);
       }
 
+      let redirectionChain;
+      let visitingUrls;
+      let finalUrl;
       try {
         // if we collect SEO: we wait for page to be fully loaded as we collect the list of referenced resources
-        const response = await page.goto(visitingUrl, collectMetaTypes.includes('resources') ? { waitUntil: 'networkidle2' } : undefined);
+        const response = await retry(async () => {
+          const res = await page.goto(visitingUrl, collectMetaTypes.includes('resources') ? { waitUntil: 'networkidle2' } : undefined)
+
+          if (!res.ok() && res.status() !== 404) {
+            throw new Error(`Resource responded with ${res.status()}`);
+          }
+
+          return res;
+        }, {
+          max: 3,
+          backoffBase: 1000,
+          backoffExponent: 1.5,
+        });
+
+        redirectionChain = response.request().redirectChain().map(request => request.url());
+        finalUrl = response.url();
+
+        visitingUrls = [...redirectionChain, finalUrl];
+
         if (!response.ok()) {
           console.error('[COULD NOT NAVIGATE]', visitingUrl, `(${response.status()})`);
-          unreachableUrls.add(visitingUrl);
-          pendingUrls.delete(visitingUrl);
+          for (const url of visitingUrls) {
+            unreachableUrls.add(url);
+            pendingUrls.delete(url);
+          }
+
           continue;
         }
       } catch (e) {
@@ -231,14 +259,21 @@ let browser;
           const pageHash = md4(await page.content());
           let lighthouseScore;
           if (collectLighthouse) {
-            lighthouseScore = await runLighthouse(browser, visitingUrl);
+            lighthouseScore = await runLighthouse(browser, finalUrl);
           }
 
-          seoState[visitingUrl] = Object.assign(pageMeta, seoMeta, {
-            anchors,
-            lighthouse: lighthouseScore,
-            hash: pageHash,
-          });
+          if (seoState[finalUrl]) {
+            seoState[finalUrl].redirectedFrom = seoState[finalUrl].redirectedFrom ?? [];
+            seoState[finalUrl].redirectedFrom.push(...redirectionChain);
+            uniq(seoState[finalUrl].redirectedFrom);
+          } else {
+            seoState[finalUrl] = Object.assign(pageMeta, seoMeta, {
+              redirectedFrom: redirectionChain,
+              anchors: uniq(anchors),
+              lighthouse: lighthouseScore,
+              hash: pageHash,
+            });
+          }
 
           // seoState[visitingUrl].microdata = await evaluateMicrodata(page);
           saveState(seoFile, seoState);
@@ -267,8 +302,10 @@ let browser;
         }
       }
 
-      visitedUrls.add(visitingUrl);
-      pendingUrls.delete(visitingUrl);
+      for (const url of visitingUrls) {
+        visitedUrls.add(url);
+        pendingUrls.delete(url);
+      }
 
       saveState(stateFile, { visitedUrls, pendingUrls, externalUrls, unreachableUrls });
     } finally {
