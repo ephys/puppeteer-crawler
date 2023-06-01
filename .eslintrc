@@ -1,0 +1,7 @@
+{
+  "extends": ["@ephys/eslint-config-typescript"],
+  "rules": {
+    "max-depth": "off",
+    "no-await-in-loop": "off"
+  }
+}
