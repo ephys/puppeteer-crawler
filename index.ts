@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import crypto from 'node:crypto';
-import fs from 'node:fs';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import lighthouse from 'lighthouse';
@@ -42,18 +42,24 @@ const cli = meow(`
 
   Options
     --check-externals      Checks whether the external links are still alive
-    --path-filter         These paths will be treated as external and won't be crawled unless --check-externals is provided. Can be provided multiple times. Micromatch syntax.
+    --only-path            If set, only these paths will be crawled. All others will be treated as external. Can be provided multiple times. Micromatch syntax.
+    --exclude-path         If set, these paths will be treated as external. Can be provided multiple times. Micromatch syntax.
     --domain-alias <url>   Add an extra domain that the scraper can consider as being the same domain as the base url.
-    --collect-meta <types> Collect SEO metadata of crawled webpages. Types: ${validMetaTypes.join(', ')} (comma-separated).
+    --collect-meta <types> Collect metadata of crawled webpages. Types: ${validMetaTypes.join(', ')} (comma-separated).
     --delay <delay>        Pause time between two page fetches in ms (default to 500ms).
     --lighthouse           Run lighthouse on crawled pages.
 
   Examples
-    $ ${cliName} https://wellmade.be --domain-alias https://www.wellmade.be
+    $ ${cliName} https://example.com --domain-alias https://www.example.com
 `, {
   importMeta: import.meta,
   flags: {
-    pathFilter: {
+    onlyPath: {
+      type: 'string',
+      isMultiple: true,
+      default: [],
+    },
+    excludePath: {
       type: 'string',
       isMultiple: true,
       default: [],
@@ -87,25 +93,32 @@ async function run() {
       return;
     }
 
+    const outDir = `${process.cwd()}/out`;
+    await fs.mkdir(outDir, { recursive: true });
+
     const canonicalHost = (new URL(initialUrl)).host;
-    const stateFile = `${process.cwd()}/${slugify(canonicalHost)}.json`;
-    const seoFile = `${process.cwd()}/${slugify(canonicalHost)}.seo.json`;
+    const stateFile = `${outDir}/${slugify(canonicalHost)}.json`;
+    const metaFile = `${outDir}/${slugify(canonicalHost)}.meta.json`;
 
     const delay = Number(cli.flags.delay);
     const collectMetaTypes = cli.flags.collectMeta.trim().split(',').filter(Boolean);
 
-    for (const collectableSeoPart of collectMetaTypes) {
-      if (!validMetaTypes.includes(collectableSeoPart)) {
-        throw new Error(`${collectableSeoPart} is not a valid meta type (expected one or multiple of ${validMetaTypes.join(', ')} separated by a comma)`);
+    for (const collectableMetaPart of collectMetaTypes) {
+      if (!validMetaTypes.includes(collectableMetaPart)) {
+        throw new Error(`${collectableMetaPart} is not a valid meta type (expected one or multiple of ${validMetaTypes.join(', ')} separated by a comma)`);
       }
     }
 
     const collectMeta = collectMetaTypes.length > 0;
     const collectLighthouse = collectMetaTypes.includes('lighthouse');
 
-    const internalPatterns = !cli.flags.pathFilter ? []
-      : Array.isArray(cli.flags.pathFilter) ? cli.flags.pathFilter
-        : [cli.flags.pathFilter];
+    const internalPatterns = !cli.flags.includePath ? []
+      : Array.isArray(cli.flags.includePath) ? cli.flags.includePath
+        : [cli.flags.includePath];
+
+    const externalPatterns = !cli.flags.excludePath ? []
+      : Array.isArray(cli.flags.excludePath) ? cli.flags.excludePath
+        : [cli.flags.excludePath];
 
     const validDomains = !cli.flags.domainAlias ? []
       : Array.isArray(cli.flags.domainAlias) ? cli.flags.domainAlias
@@ -117,17 +130,24 @@ async function run() {
     const isExternalUrl = urlStr => {
       const urlObj = new URL(urlStr);
 
-      return (internalPatterns.length > 0 && !micromatch.all(urlObj.pathname, internalPatterns))
-        || !isSameDomain(validDomains, urlStr);
+      if (!isSameDomain(validDomains, urlStr)) {
+        return true;
+      }
+
+      if (micromatch.any(urlObj.pathname, externalPatterns)) {
+        return true;
+      }
+
+      return internalPatterns.length > 0 && !micromatch.all(urlObj.pathname, internalPatterns);
     };
 
     console.info(`SAVING STATE TO ${stateFile}`);
     if (collectMeta) {
-      console.info(`SAVING METADATA TO ${seoFile}`);
+      console.info(`SAVING METADATA TO ${metaFile}`);
     }
 
     const initialState = await getInitialState(stateFile);
-    const seoState = collectMeta ? await getInitialState(seoFile) || {} : null;
+    const metaState = collectMeta ? await getInitialState(metaFile) || {} : null;
 
     browser = await puppeteer.launch({ headless: 'new' });
     const page = await browser.newPage();
@@ -148,7 +168,7 @@ async function run() {
       let moved = 0;
 
       for (const url of visitedUrls) {
-        if (!seoState[url]) {
+        if (!metaState[url]) {
           visitedUrls.delete(url);
           pendingUrls.add(url);
           moved++;
@@ -156,7 +176,7 @@ async function run() {
       }
 
       if (moved > 0) {
-        console.info(`Re-crawling ${moved} urls as their SEO data was not crawled`);
+        console.info(`Re-crawling ${moved} urls as their metadata was not crawled`);
       }
     }
 
@@ -205,7 +225,7 @@ async function run() {
         let visitingUrls;
         let finalUrl;
         try {
-          // if we collect SEO: we wait for page to be fully loaded as we collect the list of referenced resources
+          // if we collect metadata: we wait for page to be fully loaded as we collect the list of referenced resources
           const response = await retryAsPromised(async () => {
             const res = await page.goto(visitingUrl, collectMetaTypes.includes('resources') ? { waitUntil: 'networkidle2' } : undefined);
 
@@ -243,7 +263,7 @@ async function run() {
 
         if (!isVisitingExternal) {
           // eslint-disable-next-line @typescript-eslint/no-loop-func
-          const { anchors, meta: seoMeta } = await page.evaluate(() => {
+          const { anchors, meta: extractedMeta } = await page.evaluate(() => {
             const pageAnchors = [...document.querySelectorAll('a')].map(anchor => anchor.href);
 
             const metaTags = document.querySelectorAll('meta[name="robots"], meta[name="description"], meta[name="keywords"], meta[property^="og:"], meta[name^="twitter:"]');
@@ -275,12 +295,12 @@ async function run() {
               lighthouseScore = await runLighthouse(browser, finalUrl);
             }
 
-            if (seoState[finalUrl]) {
-              seoState[finalUrl].redirectedFrom = seoState[finalUrl].redirectedFrom ?? [];
-              seoState[finalUrl].redirectedFrom.push(...redirectionChain);
-              uniq(seoState[finalUrl].redirectedFrom);
+            if (metaState[finalUrl]) {
+              metaState[finalUrl].redirectedFrom = metaState[finalUrl].redirectedFrom ?? [];
+              metaState[finalUrl].redirectedFrom.push(...redirectionChain);
+              uniq(metaState[finalUrl].redirectedFrom);
             } else {
-              seoState[finalUrl] = Object.assign(pageMeta, seoMeta, {
+              metaState[finalUrl] = Object.assign(pageMeta, extractedMeta, {
                 redirectedFrom: redirectionChain,
                 anchors: uniq(anchors),
                 lighthouse: lighthouseScore,
@@ -288,8 +308,7 @@ async function run() {
               });
             }
 
-            // seoState[visitingUrl].microdata = await evaluateMicrodata(page);
-            saveState(seoFile, seoState);
+            saveState(metaFile, metaState);
           }
 
           for (const url of anchors) {
@@ -394,7 +413,7 @@ function save(filename) {
   const state = nextSaveState[filename];
   nextSaveState[filename] = null;
 
-  fs.promises.writeFile(filename, JSON.stringify(state, transformJson, 2)).then(() => {
+  fs.writeFile(filename, JSON.stringify(state, transformJson, 2)).then(() => {
     isSaving[filename] = false;
     save(filename);
   });

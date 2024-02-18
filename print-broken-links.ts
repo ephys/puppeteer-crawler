@@ -24,22 +24,22 @@ interface Metadata {
   hash: string;
 }
 
-const seo = await getJson('./localhost3000.seo.json') as Record</* url */ string, Metadata>;
-const crawlResult = await getJson('./localhost3000.json') as {
+const domainMeta = await getJson('./out/sequelize-org.meta.json') as Record</* url */ string, Metadata>;
+const crawlResult = await getJson('./out/sequelize-org.json') as {
   visitedUrls: string[],
   pendingUrls: string[],
   unreachableUrls: string[],
   externalUrls: string[],
 };
 
-for (const [url, meta] of Object.entries(seo)) {
+for (const [url, urlMeta] of Object.entries(domainMeta)) {
 
   const brokenUrls = new Set();
   const pendingUrls = new Set();
   const unvisitedUrls = new Set();
   const badUrls = new Set();
 
-  for (let anchor of meta.anchors) {
+  for (let anchor of urlMeta.anchors) {
     try {
       anchor = normalizeExternalUrl(anchor);
     } catch {
